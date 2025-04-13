@@ -18,6 +18,8 @@
 #include "light.h"
 #include "camera.h"
 #include "blur.h"
+#define TINYOBJ_LOADER_C_IMPLEMENTATION // Define this in *one* C file before including
+#include "tinyobj_loader_c.h"
 
 
 #define PI 3.14159265
@@ -317,7 +319,6 @@ int main(int argc, char *argv[])
                             // (marked by w = 87)
                             else if (fb_color.w == 87)
                             {
-                                vec4 color = get_pixel_through_camera(i, j, transformed_cam, light);
                                 paint_pixel(x_off, y_off, color, buffer, vinfo);
                             }
                         }
