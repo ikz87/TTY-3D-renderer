@@ -8,7 +8,7 @@
 #define EDGE_THICKNESS 50
 #define EDGE_COLOR (vec4){1,1,1,1}
 #define SHADER checker_pattern
-#define DOWNSCALING_FACTOR 6 // Preferably a number that divides your screen dimensions | 1 for no Down
+#define DOWNSCALING_FACTOR 8 // Preferably a number that divides your screen dimensions | 1 for no Down
 
 // Supported shaders:
 // solid_white

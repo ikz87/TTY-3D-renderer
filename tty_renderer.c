@@ -9,93 +9,945 @@
 #include <string.h>
 #include <signal.h>
 #include <time.h>
-#include <termios.h>    // For raw terminal mode
-#include <sys/select.h> // For select()
-#include <errno.h>      // For error checking (optional)
+#include <errno.h>      // For error checking
+#include <libevdev-1.0/libevdev/libevdev.h>  // For input handling
+#include <dirent.h>     // For finding DRM render nodes
+#include <gbm.h>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
+#include <GLES2/gl2ext.h>
 #include "config.h"
 #include "vectors.h"
-#include "fragment_shaders.h"
-#include "light.h"
-#include "camera.h"
-#include "blur.h"
-#define TINYOBJ_LOADER_C_IMPLEMENTATION // Define this in *one* C file before including
+#define TINYOBJ_LOADER_C_IMPLEMENTATION
 #include "tinyobj_loader_c.h"
-
 
 #define PI 3.14159265
 #define EPSILON 1e-6f
 
-volatile sig_atomic_t done = 0;
-struct termios original_termios; // Store original terminal settings
+#define GL_CHECK(x) \
+    x; \
+    { \
+        GLenum gl_err = glGetError(); \
+        if (gl_err != GL_NO_ERROR) { \
+            fprintf(stderr, "GL error %d at %s:%d\n", gl_err, __FILE__, __LINE__); \
+        } \
+    }
 
- 
-void term(int signum)
-{
+volatile sig_atomic_t done = 0;
+
+// Function pointers for VAO extension
+PFNGLGENVERTEXARRAYSOESPROC glGenVertexArraysOES;
+PFNGLBINDVERTEXARRAYOESPROC glBindVertexArrayOES;
+PFNGLDELETEVERTEXARRAYSOESPROC glDeleteVertexArraysOES;
+
+// Helper function to load extensions
+void load_gl_extensions() {
+    glGenVertexArraysOES = (PFNGLGENVERTEXARRAYSOESPROC)
+        eglGetProcAddress("glGenVertexArraysOES");
+    glBindVertexArrayOES = (PFNGLBINDVERTEXARRAYOESPROC)
+        eglGetProcAddress("glBindVertexArrayOES");
+    glDeleteVertexArraysOES = (PFNGLDELETEVERTEXARRAYSOESPROC)
+        eglGetProcAddress("glDeleteVertexArraysOES");
+        
+    // Verify extension availability
+    if (!glGenVertexArraysOES || !glBindVertexArrayOES || !glDeleteVertexArraysOES) {
+        fprintf(stderr, "VAO extensions not available\n");
+        exit(1);
+    }
+}
+
+// Structure to track key states (1 = pressed, 0 = released)
+typedef struct {
+    int w, a, s, d;
+    int h, j, k, l;
+    int q;
+    int shift; // For moving down (y+)
+    int space; // For moving up (y-)
+} KeyState;
+
+
+// Mesh structure
+typedef struct {
+    GLuint vao;
+    GLuint vbo_positions;
+    GLuint vbo_normals;
+    GLuint vbo_texcoords;
+    GLuint ebo;
+    unsigned int num_indices;
+    vec3 position;
+    vec3 rotation;
+    vec3 scale;
+} Mesh;
+
+// OpenGL/EGL structures
+struct render_device {
+    int fd;
+    uint32_t width;
+    uint32_t height;
+    
+    struct gbm_device *gbm_dev;
+    
+    EGLDisplay egl_display;
+    EGLContext egl_context;
+    
+    char device_path[256];
+    
+    // Shader variables
+    GLuint program;
+    
+    // Uniforms
+    GLint u_mvp;
+    GLint u_model;
+    GLint u_view;
+    GLint u_light_dir;
+    GLint u_light_color;
+    GLint u_camera_pos;
+};
+
+KeyState key_state = {0}; // Initialize all keys to not pressed
+struct libevdev *input_dev = NULL;
+int input_fd = -1;
+
+// Vertex shader for 3D rendering
+const char *vertex_shader_source =
+    "attribute vec3 a_position;\n"
+    "attribute vec3 a_normal;\n"
+    "attribute vec2 a_texcoord;\n"
+    "uniform mat4 u_mvp;\n"       // Model-view-projection
+    "uniform mat4 u_model;\n"     // Model matrix
+    "uniform mat4 u_view;\n"      // View matrix
+    "varying vec3 v_normal;\n"
+    "varying vec3 v_position;\n"
+    "varying vec2 v_texcoord;\n"
+    "void main() {\n"
+    "  gl_Position = u_mvp * vec4(a_position, 1.0);\n"
+    "  v_normal = mat3(u_model) * a_normal;\n"  // Transform normal to world space
+    "  v_position = (u_model * vec4(a_position, 1.0)).xyz;\n"  // Position in world space
+    "  v_texcoord = a_texcoord;\n"
+    "}\n";
+
+// Fragment shader for basic lighting
+const char *fragment_shader_source =
+    "precision mediump float;\n"
+    "varying vec3 v_normal;\n"
+    "varying vec3 v_position;\n"
+    "varying vec2 v_texcoord;\n"
+    "uniform vec3 u_light_dir;\n"
+    "uniform vec3 u_light_color;\n"
+    "uniform vec3 u_camera_pos;\n"
+    "void main() {\n"
+    "  vec3 normal = normalize(v_normal);\n"
+    "  vec3 view_dir = normalize(u_camera_pos - v_position);\n"
+    "  float diffuse = max(dot(normal, normalize(u_light_dir)), 0.0);\n"
+    "  vec3 reflect_dir = reflect(-normalize(u_light_dir), normal);\n"
+    "  float specular = pow(max(dot(view_dir, reflect_dir), 0.0), 32.0) * 0.5;\n"
+    "  vec3 ambient = vec3(0.1, 0.1, 0.1);\n"
+    "  //vec3 result = (ambient + diffuse * u_light_color + specular * u_light_color) * vec3(0.8, 0.8, 0.8);\n"
+    "vec3 result = vec3(1.0, 1.0, 0.0);\n"
+    "  gl_FragColor = vec4(result, 1.0);\n"
+    "}\n";
+
+const char *debug_fragment_shader_source =
+    "precision mediump float;\n"
+    "void main() {\n"
+    "  gl_FragColor = vec4(1.0, 1.0, 0.0, 1.0);\n" // Bright yellow
+    "}\n";
+
+void term(int signum) {
     done = 1;
 }
 
-// Function to restore terminal settings
-void restore_terminal(void) {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios);
-    printf("\033[?25h"); // Show cursor again
-    fflush(stdout);
-}
-
-// Function to set raw terminal mode
-void set_raw_terminal(void) {
-    struct termios raw;
-
-    if (tcgetattr(STDIN_FILENO, &original_termios) == -1) {
-        perror("tcgetattr");
-        exit(1);
+void cleanup_input() {
+    if (input_dev) {
+        libevdev_free(input_dev);
     }
-    // Register the cleanup function to restore settings on exit
-    atexit(restore_terminal);
-
-
-    raw = original_termios; // Copy original settings
-    // Modify settings for raw mode
-    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON); // Input modes
-    raw.c_oflag &= ~(OPOST); // Keep OPOST disabled for now
-    raw.c_cflag |= (CS8); // Control modes (8-bit chars)
-    raw.c_lflag &= ~(ECHO | ICANON | IEXTEN | ISIG); // Local modes
-    // VMIN = 0, VTIME = 0: read() returns immediately, 0 bytes if no input
-    raw.c_cc[VMIN] = 0;
-    raw.c_cc[VTIME] = 0;
-
-    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) {
-        perror("tcsetattr");
-        exit(1);
+    if (input_fd >= 0) {
+        close(input_fd);
     }
-    // printf("\033[?25l"); // Hide cursor
-    // fflush(stdout);
-}
- 
-
-void paint_pixel(int x, int y, vec4 color, char buffer[], struct fb_var_screeninfo vinfo)
-{
-    color.x = fmin(fmax(color.x, 0), 1);
-    color.y = fmin(fmax(color.y, 0), 1);
-    color.z = fmin(fmax(color.z, 0), 1);
-    color.w = fmin(fmax(color.w, 0), 1);
-    buffer[(y*vinfo.xres+x)*4] = (unsigned int)(color.z * 255);
-    buffer[(y*vinfo.xres+x)*4+1] = (unsigned int)(color.y * 255);
-    buffer[(y*vinfo.xres+x)*4+2] = (unsigned int)(color.x * 255);
-    buffer[(y*vinfo.xres+x)*4+3] = (unsigned int)(87);
-    return;
 }
 
+int setup_input(const char *device_path) {
+    // Open the input device
+    input_fd = open(device_path, O_RDONLY | O_NONBLOCK);
+    if (input_fd < 0) {
+        fprintf(stderr, "Error opening input device '%s': %s\n", 
+                device_path, strerror(errno));
+        return 0;
+    }
+    
+    // Create libevdev device
+    int rc = libevdev_new_from_fd(input_fd, &input_dev);
+    if (rc < 0) {
+        fprintf(stderr, "Failed to initialize libevdev: %s\n", strerror(-rc));
+        close(input_fd);
+        input_fd = -1;
+        return 0;
+    }
+    
+    printf("Input device name: \"%s\"\n", libevdev_get_name(input_dev));
+    printf("Ready for input...\n");
+    
+    // Register cleanup function
+    atexit(cleanup_input);
+    return 1;
+}
+
+void process_input_events() {
+    struct input_event ev;
+    int rc;
+    
+    do {
+        rc = libevdev_next_event(input_dev, LIBEVDEV_READ_FLAG_NORMAL, &ev);
+        
+        if (rc == 0 && ev.type == EV_KEY) {
+            int pressed = ev.value != 0; // 1 for press, 2 for repeat, 0 for release
+            
+            // Map key codes to our key states
+            switch (ev.code) {
+                case KEY_W: key_state.w = pressed; break;
+                case KEY_A: key_state.a = pressed; break;
+                case KEY_S: key_state.s = pressed; break;
+                case KEY_D: key_state.d = pressed; break;
+                case KEY_H: key_state.h = pressed; break;
+                case KEY_J: key_state.j = pressed; break;
+                case KEY_K: key_state.k = pressed; break;
+                case KEY_L: key_state.l = pressed; break;
+                case KEY_Q: key_state.q = pressed; break;
+                case KEY_SPACE: key_state.space = pressed; break;
+                
+                // Track shift key (either left or right shift)
+                case KEY_LEFTSHIFT:
+                case KEY_RIGHTSHIFT: 
+                    key_state.shift = pressed;
+                    break;
+            }
+        }
+    } while (rc == 1 || rc == 0); // Continue as long as there are events
+}
+
+// Compile shader
+GLuint compile_shader(GLenum type, const char *source) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, NULL);
+    glCompileShader(shader);
+
+    GLint success;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        GLchar info_log[512];
+        glGetShaderInfoLog(shader, sizeof(info_log), NULL, info_log);
+        fprintf(stderr, "Shader compilation error: %s\n", info_log);
+        glDeleteShader(shader);
+        return 0;
+    }
+
+    return shader;
+}
+
+// Link shader program
+GLuint create_program(GLuint vertex_shader, GLuint fragment_shader) {
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertex_shader);
+    glAttachShader(program, fragment_shader);
+    glLinkProgram(program);
+
+    GLint success;
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        GLchar info_log[512];
+        glGetProgramInfoLog(program, sizeof(info_log), NULL, info_log);
+        fprintf(stderr, "Program linking error: %s\n", info_log);
+        glDeleteProgram(program);
+        return 0;
+    }
+
+    return program;
+}
+
+// Find an available DRM render node
+static int find_drm_render_node(struct render_device *dev) {
+    DIR *dir;
+    struct dirent *entry;
+    int found = 0;
+    
+    dir = opendir("/dev/dri");
+    if (!dir) {
+        fprintf(stderr, "Failed to open /dev/dri directory: %s\n", strerror(errno));
+        return -1;
+    }
+    
+    while ((entry = readdir(dir)) != NULL) {
+        // Look for render nodes (renderD*)
+        if (strncmp(entry->d_name, "renderD", 7) == 0) {
+            snprintf(dev->device_path, sizeof(dev->device_path), "/dev/dri/%s", entry->d_name);
+            dev->fd = open(dev->device_path, O_RDWR);
+            if (dev->fd >= 0) {
+                found = 1;
+                printf("Using DRM render node: %s\n", dev->device_path);
+                break;
+            } else {
+                fprintf(stderr, "Failed to open %s: %s\n", dev->device_path, strerror(errno));
+            }
+        }
+    }
+    
+    closedir(dir);
+    
+    if (!found) {
+        fprintf(stderr, "No available DRM render nodes found in /dev/dri/\n");
+        return -1;
+    }
+    
+    return 0;
+}
+
+static int init_egl_surfaceless(struct render_device *dev, int width, int height) {
+    // Set render size
+    dev->width = width;
+    dev->height = height;
+
+    // Create GBM device
+    dev->gbm_dev = gbm_create_device(dev->fd);
+    if (!dev->gbm_dev) {
+        fprintf(stderr, "Failed to create GBM device: %s\n", strerror(errno));
+        return -1;
+    }
+
+    // Get EGL display
+    PFNEGLGETPLATFORMDISPLAYEXTPROC get_platform_display = 
+        (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+    if (!get_platform_display) {
+        fprintf(stderr, "Failed to get eglGetPlatformDisplayEXT function\n");
+        gbm_device_destroy(dev->gbm_dev);
+        return -1;
+    }
+
+    dev->egl_display = get_platform_display(EGL_PLATFORM_GBM_KHR, dev->gbm_dev, NULL);
+    if (dev->egl_display == EGL_NO_DISPLAY) {
+        // Try the old method if the platform method fails
+        fprintf(stderr, "Failed to get EGL display via platform extension, trying default method\n");
+        dev->egl_display = eglGetDisplay((EGLNativeDisplayType)dev->gbm_dev);
+        if (dev->egl_display == EGL_NO_DISPLAY) {
+            fprintf(stderr, "Failed to get EGL display: %04x\n", eglGetError());
+            gbm_device_destroy(dev->gbm_dev);
+            return -1;
+        }
+    }
+
+    // Initialize EGL
+    if (!eglInitialize(dev->egl_display, NULL, NULL)) {
+        fprintf(stderr, "Failed to initialize EGL: %04x\n", eglGetError());
+        gbm_device_destroy(dev->gbm_dev);
+        return -1;
+    }
+
+    // Print EGL information
+    printf("EGL Version: %s\n", eglQueryString(dev->egl_display, EGL_VERSION));
+    printf("EGL Vendor: %s\n", eglQueryString(dev->egl_display, EGL_VENDOR));
+    printf("EGL Extensions: %s\n", eglQueryString(dev->egl_display, EGL_EXTENSIONS));
+
+    // Configure EGL
+    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+        fprintf(stderr, "Failed to bind OpenGL ES API: %04x\n", eglGetError());
+        eglTerminate(dev->egl_display);
+        gbm_device_destroy(dev->gbm_dev);
+        return -1;
+    }
+
+    // Choose EGL config for surfaceless rendering
+    const EGLint config_attribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 24,  // Add depth buffer for 3D rendering
+        EGL_NONE
+    };
+    
+    EGLConfig config;
+    EGLint num_configs;
+    
+    if (!eglChooseConfig(dev->egl_display, config_attribs, &config, 1, &num_configs) || num_configs == 0) {
+        fprintf(stderr, "Failed to choose EGL config: %04x\n", eglGetError());
+        fprintf(stderr, "Trying with minimal configuration...\n");
+        
+        // Try with minimal requirements
+        const EGLint minimal_attribs[] = {
+            EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+            EGL_NONE
+        };
+        
+        if (!eglChooseConfig(dev->egl_display, minimal_attribs, &config, 1, &num_configs) || num_configs == 0) {
+            fprintf(stderr, "Still failed to choose EGL config: %04x\n", eglGetError());
+            eglTerminate(dev->egl_display);
+            gbm_device_destroy(dev->gbm_dev);
+            return -1;
+        }
+    }
+
+    printf("Found compatible EGL config\n");
+
+    // Create EGL context (no surface needed with surfaceless context)
+    const EGLint context_attribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_NONE
+    };
+    
+    dev->egl_context = eglCreateContext(
+        dev->egl_display,
+        config,
+        EGL_NO_CONTEXT,
+        context_attribs
+    );
+    if (dev->egl_context == EGL_NO_CONTEXT) {
+        fprintf(stderr, "Failed to create EGL context: %04x\n", eglGetError());
+        eglTerminate(dev->egl_display);
+        gbm_device_destroy(dev->gbm_dev);
+        return -1;
+    }
+
+    // Make context current without a surface
+    if (!eglMakeCurrent(dev->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, dev->egl_context)) {
+        fprintf(stderr, "Failed to make EGL context current: %04x\n", eglGetError());
+        eglDestroyContext(dev->egl_display, dev->egl_context);
+        eglTerminate(dev->egl_display);
+        gbm_device_destroy(dev->gbm_dev);
+        return -1;
+    }
+
+    return 0;
+}
+
+static void cleanup_egl(struct render_device *dev) {
+    // Clean up EGL
+    eglMakeCurrent(dev->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    eglDestroyContext(dev->egl_display, dev->egl_context);
+    eglTerminate(dev->egl_display);
+
+    // Clean up GBM
+    gbm_device_destroy(dev->gbm_dev);
+
+    // Close DRM FD
+    close(dev->fd);
+}
+
+// Set up shader program for 3D rendering
+int setup_3d_rendering(struct render_device *dev) {
+    // Load GL extensions
+    load_gl_extensions();
+    
+    // Compile shaders
+    GLuint vertex_shader = compile_shader(GL_VERTEX_SHADER, vertex_shader_source);
+    if (!vertex_shader) {
+        return -1;
+    }
+
+    GLuint fragment_shader = compile_shader(GL_FRAGMENT_SHADER, debug_fragment_shader_source);
+    if (!fragment_shader) {
+        glDeleteShader(vertex_shader);
+        return -1;
+    }
+
+    // Create shader program
+    dev->program = create_program(vertex_shader, fragment_shader);
+    glDeleteShader(vertex_shader);
+    glDeleteShader(fragment_shader);
+    if (!dev->program) {
+        return -1;
+    }
+
+    // Get uniform locations
+    dev->u_mvp = glGetUniformLocation(dev->program, "u_mvp");
+    dev->u_model = glGetUniformLocation(dev->program, "u_model");
+    dev->u_view = glGetUniformLocation(dev->program, "u_view");
+    dev->u_light_dir = glGetUniformLocation(dev->program, "u_light_dir");
+    dev->u_light_color = glGetUniformLocation(dev->program, "u_light_color");
+    dev->u_camera_pos = glGetUniformLocation(dev->program, "u_camera_pos");
+    
+    // Enable depth testing for 3D rendering
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL);
+    
+    glDisable(GL_CULL_FACE);
+    
+    // Set default viewport
+    glViewport(0, 0, dev->width, dev->height);
+    
+    return 0;
+}
+
+// Load an .obj model
+Mesh* load_obj_model(const char* filename) {
+    // Check if file exists first
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Cannot open file '%s': %s\n", 
+                filename, strerror(errno));
+        return NULL;
+    }
+    fclose(file);
+    
+    printf("Loading OBJ file: %s\n", filename);
+    
+    // Check if OES extension functions are initialized
+    if (!glGenVertexArraysOES || !glBindVertexArrayOES || !glDeleteVertexArraysOES) {
+        fprintf(stderr, "Error: VAO extension functions not initialized!\n");
+        return NULL;
+    }
+    
+    // Create empty mesh
+    Mesh* mesh = (Mesh*)malloc(sizeof(Mesh));
+    if (!mesh) {
+        fprintf(stderr, "Failed to allocate mesh memory\n");
+        return NULL;
+    }
+    
+    // Set default position, rotation, scale
+    mesh->position = (vec3){0.0f, 0.0f, 0.0f};
+    mesh->rotation = (vec3){0.0f, 0.0f, 0.0f};
+    mesh->scale = (vec3){3.0f, 3.0f, 3.0f};
+
+    
+    // Initialize tinyobj structures
+    tinyobj_attrib_t attrib;
+    tinyobj_shape_t* shapes = NULL;
+    size_t num_shapes = 0;
+    tinyobj_material_t* materials = NULL;
+    size_t num_materials = 0;
+    
+    memset(&attrib, 0, sizeof(attrib));
+    
+    // Set up file content buffer for safe parsing
+    unsigned int flags = TINYOBJ_FLAG_TRIANGULATE;
+    
+    // Set up error reporting
+    fprintf(stdout, "Starting OBJ parsing...\n");
+    
+    int ret = tinyobj_parse_obj(&attrib, &shapes, &num_shapes, &materials,
+                         &num_materials, filename, NULL, NULL, flags);
+                         
+    fprintf(stdout, "Parsing completed with result: %d\n", ret);
+    
+    if (ret != TINYOBJ_SUCCESS) {
+        fprintf(stderr, "Failed to load OBJ file: %s (error code %d)\n", filename, ret);
+        free(mesh);
+        return NULL;
+    }
+    
+    // Verify that we have some data
+    if (attrib.num_vertices == 0 || attrib.num_faces == 0) {
+        fprintf(stderr, "Invalid OBJ file: No vertices or faces found\n");
+        tinyobj_attrib_free(&attrib);
+        tinyobj_shapes_free(shapes, num_shapes);
+        tinyobj_materials_free(materials, num_materials);
+        free(mesh);
+        return NULL;
+    }
+    
+    printf("  Vertices: %d\n", (int)attrib.num_vertices);
+    printf("  Normals: %d\n", (int)attrib.num_normals);
+    printf("  Texcoords: %d\n", (int)attrib.num_texcoords);
+    printf("  Faces: %d\n", (int)attrib.num_faces);
+    printf("  Shapes: %d\n", (int)num_shapes);
+    
+    // Create VAO
+    glGenVertexArraysOES(1, &mesh->vao);
+    glBindVertexArrayOES(mesh->vao);
+    
+    // Create position VBO
+    glGenBuffers(1, &mesh->vbo_positions);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo_positions);
+    glBufferData(GL_ARRAY_BUFFER, attrib.num_vertices * 3 * sizeof(float),
+                attrib.vertices, GL_STATIC_DRAW);
+    
+    // Set up position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    
+    // Create normal VBO if available
+    if (attrib.num_normals > 0) {
+        glGenBuffers(1, &mesh->vbo_normals);
+        glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo_normals);
+        glBufferData(GL_ARRAY_BUFFER, attrib.num_normals * 3 * sizeof(float),
+                    attrib.normals, GL_STATIC_DRAW);
+        
+        // Set up normal attribute
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, 0);
+        glEnableVertexAttribArray(1);
+    } else {
+        // If no normals, generate simple normals (all pointing out)
+        float* normals = (float*)malloc(attrib.num_vertices * 3 * sizeof(float));
+        for (size_t i = 0; i < attrib.num_vertices * 3; i += 3) {
+            normals[i] = 0.0f;
+            normals[i+1] = 1.0f;  // All pointing up as a fallback
+            normals[i+2] = 0.0f;
+        }
+        
+        glGenBuffers(1, &mesh->vbo_normals);
+        glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo_normals);
+        glBufferData(GL_ARRAY_BUFFER, attrib.num_vertices * 3 * sizeof(float),
+                   normals, GL_STATIC_DRAW);
+        
+        // Set up normal attribute
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, 0);
+        glEnableVertexAttribArray(1);
+        
+        free(normals);
+    }
+    
+    // Create texcoord VBO if available
+    if (attrib.num_texcoords > 0) {
+        glGenBuffers(1, &mesh->vbo_texcoords);
+        glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo_texcoords);
+        glBufferData(GL_ARRAY_BUFFER, attrib.num_texcoords * 2 * sizeof(float),
+                    attrib.texcoords, GL_STATIC_DRAW);
+        
+        // Set up texcoord attribute
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
+        glEnableVertexAttribArray(2);
+    } else {
+        mesh->vbo_texcoords = 0;
+    }
+    
+    // Create element buffer for indices
+    glGenBuffers(1, &mesh->ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh->ebo);
+    
+    // Use face indices - construct an index buffer from the face data
+    unsigned int* indices = (unsigned int*)malloc(attrib.num_faces * sizeof(unsigned int));
+    if (!indices) {
+        fprintf(stderr, "Failed to allocate index buffer\n");
+        glDeleteVertexArraysOES(1, &mesh->vao);
+        glDeleteBuffers(1, &mesh->vbo_positions);
+        if (mesh->vbo_normals) glDeleteBuffers(1, &mesh->vbo_normals);
+        if (mesh->vbo_texcoords) glDeleteBuffers(1, &mesh->vbo_texcoords);
+        free(mesh);
+        tinyobj_attrib_free(&attrib);
+        tinyobj_shapes_free(shapes, num_shapes);
+        tinyobj_materials_free(materials, num_materials);
+        return NULL;
+    }
+    
+    // Use vertex indices directly
+    for (size_t i = 0; i < attrib.num_faces; i++) {
+        indices[i] = attrib.faces[i].v_idx;
+    }
+    
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, attrib.num_faces * sizeof(unsigned int),
+                indices, GL_STATIC_DRAW);
+    
+    mesh->num_indices = attrib.num_faces;
+    
+    free(indices);
+    
+    // Clean up tinyobj data
+    tinyobj_attrib_free(&attrib);
+    tinyobj_shapes_free(shapes, num_shapes);
+    tinyobj_materials_free(materials, num_materials);
+    
+    // Unbind VAO
+    glBindVertexArrayOES(0);
+    
+    return mesh;
+}
+
+// testing
+// Add this function to create a simple cube
+Mesh* create_debug_cube() {
+    float vertices[] = {
+        // Front face
+        -0.5f, -0.5f,  0.5f,
+         0.5f, -0.5f,  0.5f,
+         0.5f,  0.5f,  0.5f,
+        -0.5f,  0.5f,  0.5f,
+        // Back face
+        -0.5f, -0.5f, -0.5f,
+         0.5f, -0.5f, -0.5f,
+         0.5f,  0.5f, -0.5f,
+        -0.5f,  0.5f, -0.5f
+    };
+    
+    float normals[] = {
+        // Front face normals
+        0.0f, 0.0f, 1.0f,
+        0.0f, 0.0f, 1.0f,
+        0.0f, 0.0f, 1.0f,
+        0.0f, 0.0f, 1.0f,
+        // Back face normals
+        0.0f, 0.0f, -1.0f,
+        0.0f, 0.0f, -1.0f,
+        0.0f, 0.0f, -1.0f,
+        0.0f, 0.0f, -1.0f
+    };
+    
+    unsigned int indices[] = {
+        // Front face
+        0, 1, 2,
+        2, 3, 0,
+        // Right face
+        1, 5, 6,
+        6, 2, 1,
+        // Back face
+        5, 4, 7,
+        7, 6, 5,
+        // Left face
+        4, 0, 3,
+        3, 7, 4,
+        // Top face
+        3, 2, 6,
+        6, 7, 3,
+        // Bottom face
+        4, 5, 1,
+        1, 0, 4
+    };
+    
+    Mesh* mesh = (Mesh*)malloc(sizeof(Mesh));
+    if (!mesh) return NULL;
+    
+    mesh->position = (vec3){0.0f, 0.0f, 0.0f};
+    mesh->rotation = (vec3){0.0f, 0.0f, 0.0f};
+    mesh->scale = (vec3){3.0f, 3.0f, 3.0f};
+    
+    glGenVertexArraysOES(1, &mesh->vao);
+    glBindVertexArrayOES(mesh->vao);
+    
+    glGenBuffers(1, &mesh->vbo_positions);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo_positions);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    
+    glGenBuffers(1, &mesh->vbo_normals);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo_normals);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(normals), normals, GL_STATIC_DRAW);
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(1);
+    
+    mesh->vbo_texcoords = 0;
+    
+    glGenBuffers(1, &mesh->ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh->ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+    
+    mesh->num_indices = sizeof(indices) / sizeof(unsigned int);
+    
+    glBindVertexArrayOES(0);
+    
+    return mesh;
+}
+Mesh* load_simple_obj(const char* filename) {
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Cannot open file '%s': %s\n", 
+                filename, strerror(errno));
+        return NULL;
+    }
+    
+    printf("Loading simple OBJ file: %s\n", filename);
+    
+    // Count vertices and faces
+    char line[1024];
+    int vertex_count = 0;
+    int face_count = 0;
+    
+    while (fgets(line, sizeof(line), file)) {
+        if (line[0] == 'v' && line[1] == ' ') {
+            vertex_count++;
+        } else if (line[0] == 'f' && line[1] == ' ') {
+            face_count++;
+        }
+    }
+    
+    rewind(file);
+    
+    // Allocate arrays
+    float* vertices = (float*)malloc(vertex_count * 3 * sizeof(float));
+    unsigned int* indices = (unsigned int*)malloc(face_count * 3 * sizeof(unsigned int));
+    float* normals = (float*)malloc(vertex_count * 3 * sizeof(float));
+    
+    // Read vertices and faces
+    int v_idx = 0;
+    int f_idx = 0;
+    
+    while (fgets(line, sizeof(line), file)) {
+        if (line[0] == 'v' && line[1] == ' ') {
+            sscanf(line, "v %f %f %f", &vertices[v_idx*3], &vertices[v_idx*3+1], &vertices[v_idx*3+2]);
+            
+            // Generate simple normal (point outward)
+            float len = sqrtf(vertices[v_idx*3]*vertices[v_idx*3] + 
+                             vertices[v_idx*3+1]*vertices[v_idx*3+1] + 
+                             vertices[v_idx*3+2]*vertices[v_idx*3+2]);
+            if (len > 0.0001f) {
+                normals[v_idx*3] = vertices[v_idx*3] / len;
+                normals[v_idx*3+1] = vertices[v_idx*3+1] / len;
+                normals[v_idx*3+2] = vertices[v_idx*3+2] / len;
+            } else {
+                normals[v_idx*3] = 0.0f;
+                normals[v_idx*3+1] = 1.0f;
+                normals[v_idx*3+2] = 0.0f;
+            }
+            
+            v_idx++;
+        } 
+        else if (line[0] == 'f' && line[1] == ' ') {
+            int v1, v2, v3;
+            // OBJ indices start at 1, so subtract 1 for 0-based arrays
+            sscanf(line, "f %d %d %d", &v1, &v2, &v3);
+            indices[f_idx*3] = v1-1;
+            indices[f_idx*3+1] = v2-1;
+            indices[f_idx*3+2] = v3-1;
+            f_idx++;
+        }
+    }
+    
+    fclose(file);
+    
+    // Create mesh
+    Mesh* mesh = (Mesh*)malloc(sizeof(Mesh));
+    if (!mesh) {
+        free(vertices);
+        free(indices);
+        free(normals);
+        return NULL;
+    }
+    
+    // Set default position, rotation, scale
+    mesh->position = (vec3){0.0f, 0.0f, 0.0f};
+    mesh->rotation = (vec3){0.0f, 0.0f, 0.0f};
+    mesh->scale = (vec3){3.0f, 3.0f, 3.0f};
+    
+    // Create VAO
+    glGenVertexArraysOES(1, &mesh->vao);
+    glBindVertexArrayOES(mesh->vao);
+    
+    // Create position VBO
+    glGenBuffers(1, &mesh->vbo_positions);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo_positions);
+    glBufferData(GL_ARRAY_BUFFER, vertex_count * 3 * sizeof(float), vertices, GL_STATIC_DRAW);
+    
+    // Set up position attribute
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(0);
+    
+    // Create normal VBO
+    glGenBuffers(1, &mesh->vbo_normals);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh->vbo_normals);
+    glBufferData(GL_ARRAY_BUFFER, vertex_count * 3 * sizeof(float), normals, GL_STATIC_DRAW);
+    
+    // Set up normal attribute
+    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 0, 0);
+    glEnableVertexAttribArray(1);
+    
+    // No texcoords in simple implementation
+    mesh->vbo_texcoords = 0;
+    
+    // Create element buffer
+    glGenBuffers(1, &mesh->ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh->ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, face_count * 3 * sizeof(unsigned int), indices, GL_STATIC_DRAW);
+    
+    mesh->num_indices = face_count * 3;
+    
+    // Clean up
+    free(vertices);
+    free(indices);
+    free(normals);
+    
+    // Unbind VAO
+    glBindVertexArrayOES(0);
+    
+    printf("  Vertices: %d\n", vertex_count);
+    printf("  Faces: %d\n", face_count);
+    
+    return mesh;
+}
+
+
+// Free mesh resources
+void free_mesh(Mesh* mesh) {
+    if (!mesh) return;
+    
+    glDeleteVertexArraysOES(1, &mesh->vao);
+    glDeleteBuffers(1, &mesh->vbo_positions);
+    if (mesh->vbo_normals) glDeleteBuffers(1, &mesh->vbo_normals);
+    if (mesh->vbo_texcoords) glDeleteBuffers(1, &mesh->vbo_texcoords);
+    glDeleteBuffers(1, &mesh->ebo);
+    
+    free(mesh);
+}
+
+// Copy rendered pixels to framebuffer with proper format conversion
+void copy_to_framebuffer(unsigned char *pixels, int width, int height, struct fb_var_screeninfo vinfo, struct fb_fix_screeninfo finfo, char *fbp) {
+    int fb_width = vinfo.xres;
+    int fb_height = vinfo.yres;
+    int bpp = vinfo.bits_per_pixel;
+    
+    // Calculate how much of the image to draw (don't exceed framebuffer dimensions)
+    int draw_width = (width < fb_width) ? width : fb_width;
+    int draw_height = (height < fb_height) ? height : fb_height;
+    
+    if (bpp == 32) { // 32 bits per pixel (RGBA or ARGB)
+        for (int y = 0; y < draw_height; y++) {
+            for (int x = 0; x < draw_width; x++) {
+                int fb_offset = (y * finfo.line_length) + (x * (bpp / 8));
+                int pixels_offset = ((height - 1 - y) * width + x) * 4; // Flip vertically
+                
+                // Map RGBA to framebuffer format
+                *((uint8_t*)(fbp + fb_offset + vinfo.red.offset/8)) = pixels[pixels_offset];
+                *((uint8_t*)(fbp + fb_offset + vinfo.green.offset/8)) = pixels[pixels_offset + 1];
+                *((uint8_t*)(fbp + fb_offset + vinfo.blue.offset/8)) = pixels[pixels_offset + 2];
+                
+                if (vinfo.transp.length > 0) {
+                    *((uint8_t*)(fbp + fb_offset + vinfo.transp.offset/8)) = pixels[pixels_offset + 3];
+                }
+            }
+        }
+    } else if (bpp == 24) { // 24 bits per pixel (RGB)
+        for (int y = 0; y < draw_height; y++) {
+            for (int x = 0; x < draw_width; x++) {
+                int fb_offset = (y * finfo.line_length) + (x * (bpp / 8));
+                int pixels_offset = ((height - 1 - y) * width + x) * 4; // Flip vertically
+                
+                // Map RGB to framebuffer
+                *((uint8_t*)(fbp + fb_offset + vinfo.red.offset/8)) = pixels[pixels_offset];
+                *((uint8_t*)(fbp + fb_offset + vinfo.green.offset/8)) = pixels[pixels_offset + 1];
+                *((uint8_t*)(fbp + fb_offset + vinfo.blue.offset/8)) = pixels[pixels_offset + 2];
+            }
+        }
+    } else if (bpp == 16) { // 16 bits per pixel (RGB565 usually)
+        for (int y = 0; y < draw_height; y++) {
+            for (int x = 0; x < draw_width; x++) {
+                int fb_offset = (y * finfo.line_length) + (x * (bpp / 8));
+                int pixels_offset = ((height - 1 - y) * width + x) * 4; // Flip vertically
+                
+                // Convert RGB to RGB565 or other 16-bit format
+                uint16_t color = 
+                    ((pixels[pixels_offset] >> (8 - vinfo.red.length)) << vinfo.red.offset) |
+                    ((pixels[pixels_offset + 1] >> (8 - vinfo.green.length)) << vinfo.green.offset) |
+                    ((pixels[pixels_offset + 2] >> (8 - vinfo.blue.length)) << vinfo.blue.offset);
+                
+                *((uint16_t*)(fbp + fb_offset)) = color;
+            }
+        }
+    }
+}
 
 int main(int argc, char *argv[])
 {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <obj_file.obj> [input_device_path]\n", argv[0]);
+        return 1;
+    }
+
     struct sigaction action;
     memset(&action, 0, sizeof(struct sigaction));
     action.sa_handler = term;
     sigaction(SIGINT, &action, NULL);
 
-    set_raw_terminal();
-
-    int fbfd = open(FB_DEVICE, O_RDWR);
+    // Open the framebuffer device
+    int fbfd = open("/dev/fb0", O_RDWR);
     if (fbfd == -1) {
         perror("Error opening framebuffer device");
         exit(1);
@@ -121,241 +973,358 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    size_t buffer_size = (size_t)vinfo.xres * vinfo.yres * 4;
-    char* buffer = calloc(buffer_size, 1); // Use calloc for zero-init
-    if (buffer == NULL) {
-        perror("Error allocating draw buffer");
+    // Check for input device argument
+    const char *input_device = "/dev/input/event3"; // Default
+    if (argc > 2) {
+        input_device = argv[2];
+    }
+    
+    // Initialize input
+    if (!setup_input(input_device)) {
+        fprintf(stderr, "Could not initialize input. Try providing your input device path as argument.\n");
+        fprintf(stderr, "For example: %s %s /dev/input/event3\n", argv[0], argv[1]);
+        fprintf(stderr, "Find your keyboard device with: cat /proc/bus/input/devices\n");
         munmap(fbp, screensize);
         close(fbfd);
-        exit(1);
+        return 1;
     }
 
-    // Save the current state of the fb
-    memcpy(buffer, fbp, 4 * vinfo.xres * vinfo.yres);
+    // Initialize GL rendering
+    struct render_device gl_dev = {0};
+    
+    // Find and open a DRM render node
+    if (find_drm_render_node(&gl_dev) < 0) {
+        munmap(fbp, screensize);
+        close(fbfd);
+        return 1;
+    }
 
-    // Declare camera and light
-    camera cam;
-    light3 light;
+    // Initialize EGL for surfaceless rendering
+    if (init_egl_surfaceless(&gl_dev, vinfo.xres, vinfo.yres) < 0) {
+        close(gl_dev.fd);
+        munmap(fbp, screensize);
+        close(fbfd);
+        return 1;
+    }
 
-    // Get image data
-    #ifdef IMAGE
-    FILE* image_file = fopen(IMAGE, "r");
-    fread(image_data, SIDE_LENGTH*SIDE_LENGTH, 3, image_file);
-    fclose(image_file);
-    #endif
+    printf("Initialized surfaceless rendering context: %dx%d\n", gl_dev.width, gl_dev.height);
 
-    // Time for frame limiter
-    double time = 0;
-    double time_cyclic = 0;
+    // Setup 3D rendering
+    if (setup_3d_rendering(&gl_dev) < 0) {
+        cleanup_egl(&gl_dev);
+        munmap(fbp, screensize);
+        close(fbfd);
+        return 1;
+    }
+
+    if (!glGenVertexArraysOES || !glBindVertexArrayOES || !glDeleteVertexArraysOES) {
+        fprintf(stderr, "Error: OpenGL ES VAO extensions were not properly initialized!\n");
+        cleanup_egl(&gl_dev);
+        munmap(fbp, screensize);
+        close(fbfd);
+        return 1;
+    }
+
+    // Load OBJ model
+    Mesh* mesh = create_debug_cube();
+    if (!mesh) {
+        fprintf(stderr, "Failed to load OBJ model: %s\n", argv[1]);
+        cleanup_egl(&gl_dev);
+        munmap(fbp, screensize);
+        close(fbfd);
+        return 1;
+    }
+
+    // Allocate pixels buffer for reading back the rendered image
+    unsigned char *pixels = (unsigned char *)malloc(gl_dev.width * gl_dev.height * 4);
+    if (!pixels) {
+        fprintf(stderr, "Failed to allocate memory for pixels\n");
+        free_mesh(mesh);
+        cleanup_egl(&gl_dev);
+        munmap(fbp, screensize);
+        close(fbfd);
+        return 1;
+    }
+
+    // Time for timing/animation
+    float time = 0;
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC_RAW, &start);
     unsigned int delta_us = 0;
-    double delta = delta_us;
+    float delta = delta_us;
 
-    // Some flags for input
-    int w_pressed = 0, a_pressed = 0, s_pressed = 0, d_pressed = 0;
-    int k_pressed = 0, j_pressed = 0, h_pressed = 0, l_pressed = 0;
-    int W_pressed = 0, S_pressed = 0;
-    int q_pressed = 0;
-
-
-    // Also some vars for camera position and rotation
-    vec3 camera_position = (vec3) {0, 0, -2*SIDE_LENGTH};
+    // Camera position and rotation vars
+    vec3 camera_position = (vec3) {0, 0, 3.0f};  // Start a bit back from the origin
     vec3 camera_rotation = (vec3) {0, 0, 0};
-    int move_speed = 5000;
-    int rotation_speed = PI;
+    float move_speed = 2.0f;
+    float rotation_speed = 1.0f;
+
+    printf("Rendering OBJ model: %s\n", argv[1]);
+    printf("Controls: WASD = move, HJKL = rotate camera, SPACE = up, SHIFT = down, Q = quit\n");
+
+    // Frame buffer to use with renderbuffers
+    GLuint fbo, color_rb, depth_rb;
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    
+    // Create color renderbuffer
+    glGenRenderbuffers(1, &color_rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, color_rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA4, gl_dev.width, gl_dev.height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, color_rb);
+    
+    // Create depth renderbuffer
+    glGenRenderbuffers(1, &depth_rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, depth_rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, gl_dev.width, gl_dev.height);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth_rb);
+    
+    // Check framebuffer completeness
+    GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "Framebuffer not complete: %d\n", status);
+        free(pixels);
+        free_mesh(mesh);
+        cleanup_egl(&gl_dev);
+        munmap(fbp, screensize);
+        close(fbfd);
+        return 1;
+    }
+    
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
 
     while (!done)
     {
         clock_gettime(CLOCK_MONOTONIC_RAW, &start);
-        time += SPEED*delta*20;
-        time_cyclic = ((int)time%100)/(100/2.0);
+        time += delta;
 
-
-        // Reset flags 
-        w_pressed = a_pressed = s_pressed = d_pressed = 0;
-        h_pressed = j_pressed = k_pressed = l_pressed = 0;
-        W_pressed = S_pressed = 0;
-        q_pressed = 0;
-
-
-        // --- Raw Terminal Input Processing ---
-        char input_buf[32]; // Buffer for potentially multiple inputs/sequences
-        ssize_t total_bytes_read = 0;
-        int select_ret;
-
-        // Loop select/read to consume all available input for this frame
-        do {
-            struct timeval tv = { 0L, 0L }; // Check immediately
-            fd_set fds;
-            FD_ZERO(&fds);
-            FD_SET(STDIN_FILENO, &fds);
-            select_ret = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
-
-            if (select_ret > 0) {
-                // Read available data, append to buffer if space allows
-                if (total_bytes_read < sizeof(input_buf) - 1) {
-                    ssize_t bytes_read = read(STDIN_FILENO,
-                                              input_buf + total_bytes_read,
-                                              sizeof(input_buf) - 1 - total_bytes_read);
-                    if (bytes_read > 0) {
-                        total_bytes_read += bytes_read;
-                    } else if (bytes_read == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                        perror("read");
-                        done = 1; // Exit on read error
-                        break;    // Exit inner loop
-                    } else {
-                        // bytes_read == 0 or EAGAIN/EWOULDBLOCK means no more data right now
-                        select_ret = 0; // Force exit from inner loop
-                    }
-                } else {
-                    // Input buffer full, process what we have and try again next frame
-                    select_ret = 0; // Force exit from inner loop
-                }
-            } else if (select_ret == -1 && errno != EINTR) {
-                perror("select");
-                done = 1; // Exit on select error
-            }
-            // Continue looping if select found data and we read something
-        } while (select_ret > 0 && !done);
-
-        // Null-terminate the buffer
-        input_buf[total_bytes_read] = '\0';
-
-        // Process the accumulated input buffer to set state flags
-        for (ssize_t i = 0; i < total_bytes_read; ++i) {
-            if (input_buf[i] == 'q' || input_buf[i] == 'Q') { q_pressed = 1; }
-            if (input_buf[i] == 'w') { w_pressed = 1; }
-            if (input_buf[i] == 's') { s_pressed = 1; }
-            if (input_buf[i] == 'W') { W_pressed = 1; }
-            if (input_buf[i] == 'S') { S_pressed = 1; }
-            if (input_buf[i] == 'a' || input_buf[i] == 'A') { a_pressed = 1; }
-            if (input_buf[i] == 'd' || input_buf[i] == 'D') { d_pressed = 1; }
-            if (input_buf[i] == 'h' || input_buf[i] == 'H') { h_pressed = 1; }
-            if (input_buf[i] == 'j' || input_buf[i] == 'J') { j_pressed = 1; }
-            if (input_buf[i] == 'k' || input_buf[i] == 'K') { k_pressed = 1; }
-            if (input_buf[i] == 'l' || input_buf[i] == 'L') { l_pressed = 1; }
+        // Process input events
+        process_input_events();
+        
+        // Check if quit key pressed
+        if (key_state.q) { 
+            done = 1;
+            continue; 
         }
-
-        if (q_pressed) { done = 1; } // Check quit flag
         
         // Calculate basis vectors based on current rotation
-        vec3 forward = { -cos(camera_rotation.y + PI/2.0), 0, sin(camera_rotation.y + PI/2.0) };
+        vec3 forward = { -sin(camera_rotation.y), 0, -cos(camera_rotation.y) };
         vec3 right = { cos(camera_rotation.y), 0, -sin(camera_rotation.y) };
         forward = normalize_vec3(forward);
         right = normalize_vec3(right);
+        vec3 up = {0, 1, 0};
 
-        // Apply movement based on flags
-        if (w_pressed) { camera_position = add_vec3(camera_position, scale_vec3(forward, move_speed * delta)); }
-        if (s_pressed) { camera_position = subtract_vec3(camera_position, scale_vec3(forward, move_speed * delta)); }
-        if (a_pressed) { camera_position = subtract_vec3(camera_position, scale_vec3(right, move_speed * delta)); }
-        if (d_pressed) { camera_position = add_vec3(camera_position, scale_vec3(right, move_speed * delta)); }
+        // Apply movement based on key states
+        if (key_state.w) { camera_position = add_vec3(camera_position, scale_vec3(forward, move_speed * delta)); }
+        if (key_state.s) { camera_position = subtract_vec3(camera_position, scale_vec3(forward, move_speed * delta)); }
+        if (key_state.a) { camera_position = subtract_vec3(camera_position, scale_vec3(right, move_speed * delta)); }
+        if (key_state.d) { camera_position = add_vec3(camera_position, scale_vec3(right, move_speed * delta)); }
 
-        // Apply rotation based on flags
-        if (k_pressed) { camera_rotation.x += rotation_speed * delta; }
-        if (j_pressed) { camera_rotation.x -= rotation_speed * delta; }
-        if (h_pressed) { camera_rotation.y -= rotation_speed * delta; }
-        if (l_pressed) { camera_rotation.y += rotation_speed * delta; }
+        // Apply rotation based on key states
+        if (key_state.k) { camera_rotation.x += rotation_speed * delta; }
+        if (key_state.j) { camera_rotation.x -= rotation_speed * delta; }
+        if (key_state.h) { camera_rotation.y -= rotation_speed * delta; }
+        if (key_state.l) { camera_rotation.y += rotation_speed * delta; }
 
         // Clamp pitch
         camera_rotation.x = fmaxf(-PI/2.0f + EPSILON, fminf(PI/2.0f - EPSILON, camera_rotation.x));
 
-        // Go up and down
-        if (W_pressed) { camera_position.y -= move_speed * delta; }
-        if (S_pressed) { camera_position.y += move_speed * delta; }
+        // Vertical movement (y-axis)
+        if (key_state.space) { camera_position.y += move_speed * delta; } // Move up (y+)
+        if (key_state.shift) { camera_position.y -= move_speed * delta; } // Move down (y-)
 
-        // Define the camera
-        cam = (camera){-SIDE_LENGTH,
-            (vec2){vinfo.xres, vinfo.yres},
-            camera_rotation,
-            camera_position,
-            (vec3){1,1,1},
-
-            (vec2){0,0},
-            (vec3){0,0,0},
-            (vec3){0,0,0},
-            (vec3){0,0,0},
-            (vec3){0,0,0},
-            (vec3){0,0,0}};
-        camera transformed_cam = setup_camera(cam);
-
-        // Define the light source
-
-        vec3 light_offset = (vec3){SIDE_LENGTH*3,-SIDE_LENGTH*2,-SIDE_LENGTH};
-        light = (light3){
-            (vec3){1,1,1},
-            light_offset
+        // Compute view direction based on rotation
+        vec3 view_dir = {
+            sin(camera_rotation.y) * cos(camera_rotation.x),
+            sin(camera_rotation.x),
+            cos(camera_rotation.y) * cos(camera_rotation.x)
         };
+        
+        // Calculate look-at target
+        vec3 target = add_vec3(camera_position, view_dir);
+        
+        // Create view matrix (camera transform)
+        mat4 view_matrix = mat4_look_at(camera_position, target, up);
+        
+        // Create projection matrix
+        float aspect_ratio = (float)gl_dev.width / (float)gl_dev.height;
+        mat4 projection_matrix = mat4_perspective(45.0f * (PI / 180.0f), aspect_ratio, 0.1f, 100.0f);
+        
+        // Create model matrix for the mesh
+        mat4 model_matrix = mat4_identity();
+        model_matrix = mat4_translate(model_matrix, mesh->position);
+        
+        // Apply rotations in order: Y, X, Z
+        mat4 rot_y = mat4_rotate_y(mesh->rotation.y + time * 0.5f); // Add animation
+        mat4 rot_x = mat4_rotate_x(mesh->rotation.x);
+        mat4 rot_z = mat4_rotate_z(mesh->rotation.z);
+        
+        model_matrix = mat4_multiply(model_matrix, rot_y);
+        model_matrix = mat4_multiply(model_matrix, rot_x);
+        model_matrix = mat4_multiply(model_matrix, rot_z);
+        
+        model_matrix = mat4_scale(model_matrix, mesh->scale);
+        
+        // Compute MVP matrix
+        mat4 mvp = mat4_multiply(projection_matrix, view_matrix);
+        mvp = mat4_multiply(mvp, model_matrix);
+        
+        // Clear framebuffer
+        glClearColor(0.2f, 0.2f, 0.4f, 1.0f); // Dark blue instead of red
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        
+        // Use shader program
+        // Super minimal rendering test
+glUseProgram(0); // Disable any existing program
 
-        for (int j = 0; j < vinfo.yres; j += DOWNSCALING_FACTOR)
-        {
-            for (int i = 0; i < vinfo.xres; i += DOWNSCALING_FACTOR)
-            {
-                vec4 color = get_pixel_through_camera(i, j, transformed_cam, light);
-                for (int dc_offset_x = 0; dc_offset_x < DOWNSCALING_FACTOR; dc_offset_x++)
-                {
-                    for (int dc_offset_y = 0; dc_offset_y < DOWNSCALING_FACTOR; dc_offset_y++)
-                    {
-                        int x_off = i + dc_offset_x;
-                        int y_off = j + dc_offset_y;
-                        if (RENDER_OVER_TEXT)
-                        {
-                            paint_pixel(x_off, y_off, color, buffer, vinfo);
-                        }
-                        else
-                        {
-                            // Don't paint over tty text
-                            vec4 fb_color = {buffer[((y_off)*vinfo.xres+x_off)*4],
-                                buffer[(y_off*vinfo.xres+x_off)*4+1],
-                                buffer[(y_off*vinfo.xres+x_off)*4+2],
-                                buffer[(y_off*vinfo.xres+x_off)*4+3]};
-                            if (fb_color.x == 0 &&
-                                fb_color.y == 0 &&
-                                fb_color.z == 0)
-                            {
-                                paint_pixel(x_off, y_off, color, buffer, vinfo);
-                            }
-                            // Also repaint previously painted pixels
-                            // (marked by w = 87)
-                            else if (fb_color.w == 87)
-                            {
-                                paint_pixel(x_off, y_off, color, buffer, vinfo);
-                            }
-                        }
-                    }
-                }
-            }
+// Create absolute minimal shaders
+const char *min_vs = 
+    "attribute vec4 position;\n"
+    "void main() {\n"
+    "  gl_Position = position;\n"
+    "}\n";
+
+const char *min_fs =
+    "precision mediump float;\n"
+    "void main() {\n"
+    "  gl_FragColor = vec4(0.0, 1.0, 0.0, 1.0);\n" // Green
+    "}\n";
+
+// Compile with extensive error checking
+GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+glShaderSource(vs, 1, &min_vs, NULL);
+glCompileShader(vs);
+
+GLint success;
+GLchar infoLog[512];
+glGetShaderiv(vs, GL_COMPILE_STATUS, &success);
+printf("Vertex shader compile status: %d\n", success);
+if (!success) {
+    glGetShaderInfoLog(vs, 512, NULL, infoLog);
+    printf("VS error: %s\n", infoLog);
+}
+
+GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+glShaderSource(fs, 1, &min_fs, NULL);
+glCompileShader(fs);
+glGetShaderiv(fs, GL_COMPILE_STATUS, &success);
+printf("Fragment shader compile status: %d\n", success);
+if (!success) {
+    glGetShaderInfoLog(fs, 512, NULL, infoLog);
+    printf("FS error: %s\n", infoLog);
+}
+
+GLuint program = glCreateProgram();
+glAttachShader(program, vs);
+glAttachShader(program, fs);
+glLinkProgram(program);
+glGetProgramiv(program, GL_LINK_STATUS, &success);
+printf("Program link status: %d\n", success);
+if (!success) {
+    glGetProgramInfoLog(program, 512, NULL, infoLog);
+    printf("Program error: %s\n", infoLog);
+}
+
+glUseProgram(program);
+
+        
+        // Set uniforms
+        if (gl_dev.u_mvp != -1) {
+            glUniformMatrix4fv(gl_dev.u_mvp, 1, GL_FALSE, mvp.m);
         }
+        
+        if (gl_dev.u_model != -1) {
+            glUniformMatrix4fv(gl_dev.u_model, 1, GL_FALSE, model_matrix.m);
+        }
+        
+        if (gl_dev.u_view != -1) {
+            glUniformMatrix4fv(gl_dev.u_view, 1, GL_FALSE, view_matrix.m);
+        }
+        
+        if (gl_dev.u_light_dir != -1) {
+            // Light direction (normalized)
+            vec3 light_dir = {1.0f, 1.0f, 1.0f};
+            light_dir = normalize_vec3(light_dir);
+            glUniform3f(gl_dev.u_light_dir, light_dir.x, light_dir.y, light_dir.z);
+        }
+        
+        if (gl_dev.u_light_color != -1) {
+            // Light color
+            glUniform3f(gl_dev.u_light_color, 1.0f, 1.0f, 1.0f);
+        }
+        
+        if (gl_dev.u_camera_pos != -1) {
+            // Camera position for specular calculations
+            glUniform3f(gl_dev.u_camera_pos, camera_position.x, camera_position.y, camera_position.z);
+        }
+        
+// Clear previous errors
+while(glGetError() != GL_NO_ERROR);
 
+// Create minimal working example with proper VBO
+float triangle[] = {
+    0.0f, 0.8f, 0.0f,   // top
+   -0.8f, -0.8f, 0.0f,  // bottom left
+    0.8f, -0.8f, 0.0f   // bottom right
+};
+
+// Create and bind VBO
+GLuint vbo;
+glGenBuffers(1, &vbo);
+glBindBuffer(GL_ARRAY_BUFFER, vbo);
+glBufferData(GL_ARRAY_BUFFER, sizeof(triangle), triangle, GL_STATIC_DRAW);
+
+// Use position attribute from the shader
+GLint posAttrib = glGetAttribLocation(program, "position");
+printf("Position attribute location: %d\n", posAttrib);
+glVertexAttribPointer(posAttrib, 3, GL_FLOAT, GL_FALSE, 0, 0);
+glEnableVertexAttribArray(posAttrib);
+
+// Draw with error checking
+GLenum err = glGetError();
+printf("Before draw GL error: %d\n", err);
+
+glDrawArrays(GL_TRIANGLES, 0, 3);
+
+err = glGetError();
+printf("After draw GL error: %d\n", err);
+
+// Make sure we read pixels after drawing
+glReadPixels(0, 0, gl_dev.width, gl_dev.height, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+
+// Check a few pixel values directly
+printf("Center pixel: R=%d G=%d B=%d A=%d\n", 
+       pixels[(gl_dev.height/2 * gl_dev.width + gl_dev.width/2) * 4],
+       pixels[(gl_dev.height/2 * gl_dev.width + gl_dev.width/2) * 4 + 1],
+       pixels[(gl_dev.height/2 * gl_dev.width + gl_dev.width/2) * 4 + 2],
+       pixels[(gl_dev.height/2 * gl_dev.width + gl_dev.width/2) * 4 + 3]);
+        
+        // Copy to framebuffer
         // For some reason, the fb doesn't update fast enough
         // unless we print something first
         printf("\r");
         fflush(stdout);
-        memcpy(fbp, buffer, 4 * vinfo.xres * vinfo.yres);
+
+        copy_to_framebuffer(pixels, gl_dev.width, gl_dev.height, vinfo, finfo, fbp);
         
+        // Frame timing
         clock_gettime(CLOCK_MONOTONIC_RAW, &end);
         delta_us = (end.tv_sec - start.tv_sec) * 1000000 + (end.tv_nsec - start.tv_nsec) / 1000;
-
-        if (FRAME_LIMIT > 0)
-        {
-            if (delta_us < 1000000.0 / FRAME_LIMIT)
-            {
-                usleep(1000000.0 / FRAME_LIMIT - delta_us);
-                delta = 1.0 / FRAME_LIMIT;
-            }
-            else
-            {
-                delta = delta_us/1000000.0;
-            }
-        }
-        else
-        {
-            delta = delta_us/1000000.0;
-        }
+        delta = delta_us / 1000000.0f;
+        
     }
+
+    // Cleanup
+    glDeleteRenderbuffers(1, &color_rb);
+    glDeleteRenderbuffers(1, &depth_rb);
+    glDeleteFramebuffers(1, &fbo);
+    free(pixels);
+    free_mesh(mesh);
+    glDeleteProgram(gl_dev.program);
+    cleanup_egl(&gl_dev);
     munmap(fbp, screensize);
     close(fbfd);
-    free(buffer);
 
     return 0;
 }
+
